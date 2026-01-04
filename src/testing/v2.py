@@ -2,6 +2,7 @@ import random
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import numpy as np
+from matplotlib.colors import ListedColormap
 from noise import pnoise2
 
 # --- Parameters ---
@@ -12,18 +13,26 @@ MAX_HUNGER_FOR_MATING = 5      # must be well-fed to mate
 MAX_HUNGER_FOR_PREGNANCY = 8   # must stay fed during pregnancy
 BIRTH_HUNGER_COST = 3          # energy cost of giving birth
 
-N_HERBIVORES = 30
-N_CARNIVORES = 12
+N_HERBIVORES = 40
+N_CARNIVORES = 20
+
+VISION_RADIUS_HERBIVORE = 6
+VISION_RADIUS_CARNIVORE = 8
 
 WORLD_SIZE = 50
+WORLD_SEED = 10
+
+SEA_LEVEL = 0.45
+BEACH_LEVEL = 0.50
+
 
 # --- Environment ---
 class Environment:
-    def __init__(self, width, height, sea_level=0.45):
+    def __init__(self, width, height, sea_level=SEA_LEVEL):
         self.width = width
         self.height = height
 
-        self.heightmap = generate_perlin_terrain(width, height)
+        self.heightmap = generate_perlin_terrain(width, height, seed=WORLD_SEED)
         self.grid = (self.heightmap < sea_level).astype(int)  
         # 0 = land, 1 = water
 
@@ -49,12 +58,22 @@ class Environment:
             ):
                 self.plants.add((x, y))
 
+    def random_land_cell(self):
+        while True:
+            x = random.randrange(self.width)
+            y = random.randrange(self.height)
+            if self.grid[y][x] == 0:
+                return x, y
+
+
 
 
 # --- Function to generate terrain ---
 def generate_perlin_terrain(width, height, scale=50, octaves=4,
-                             persistence=0.5, lacunarity=2.0, seed=0):
+                             persistence=0.5, lacunarity=2.0, seed = None):
     terrain = np.zeros((height, width))
+    if seed is None:
+        seed = random.randint(0,100)
     for y in range(height):
         for x in range(width):
             terrain[y][x] = pnoise2(
@@ -74,13 +93,14 @@ def generate_perlin_terrain(width, height, scale=50, octaves=4,
 
 # --- Animals ---
 class Animal:
-    def __init__(self, x, y, species, hunger_limit=20):
+    def __init__(self, x, y, species, hunger_limit=20, vision_radius=5):
         self.x = x
         self.y = y
         self.species = species
         self.hunger = 0
         self.hunger_limit = hunger_limit
         self.alive = True
+        self.vision_radius = vision_radius
 
         # Reproduction
         self.sex = random.choice(["M", "F"])
@@ -94,6 +114,10 @@ class Animal:
         ny = max(0, min(env.height - 1, self.y + dy))
         if env.grid[ny][nx] == 0:
             self.x, self.y = nx, ny
+
+    def within_vision(self, x, y):
+       return abs(self.x - x) <= self.vision_radius and abs(self.y - y) <= self.vision_radius
+
 
     def step(self, env, others):
         self.move_randomly(env)
@@ -135,28 +159,40 @@ class Animal:
                 break
 
 
-    def give_birth(self):
-        # Must be sufficiently fed to give birth
+    def give_birth(self, env):
         if self.hunger > MAX_HUNGER_FOR_PREGNANCY:
             self.pregnant = False
             self.gestation_timer = 0
             return []
 
         litter_size = random.randint(1, 4)
-        offspring = []
+        offspring_positions = []
 
         for _ in range(litter_size):
-            dx, dy = random.choice([-1, 0, 1]), random.choice([-1, 0, 1])
-            ox = self.x + dx
-            oy = self.y + dy
-            offspring.append((ox, oy))
+            placed = False
+            for _ in range(8):  # try nearby cells first
+                dx, dy = random.choice([-1, 0, 1]), random.choice([-1, 0, 1])
+                x = self.x + dx
+                y = self.y + dy
 
-        # Energy cost of birth
+                if (
+                    0 <= x < env.width
+                    and 0 <= y < env.height
+                    and env.grid[y][x] == 0
+                ):
+                    offspring_positions.append((x, y))
+                    placed = True
+                    break
+
+            if not placed:
+                # fallback to random land cell
+                offspring_positions.append(env.random_land_cell())
+
         self.hunger += BIRTH_HUNGER_COST
-
         self.pregnant = False
         self.gestation_timer = 0
-        return offspring
+        return offspring_positions
+
 
     
     def move_towards(self, target_positions, env):
@@ -185,33 +221,42 @@ class Animal:
 
 class Herbivore(Animal):
     def __init__(self, x, y):
-        super().__init__(x, y, "herbivore")
+        super().__init__(x, y, "herbivore", vision_radius=VISION_RADIUS_HERBIVORE)
 
     def step(self, env, others):
         super().step(env, others)
 
-        # --- Determine movement target ---
-        # 1. Hunger
-        if self.hunger >= HUNGER_THRESHOLD and env.plants:
-            self.move_towards(env.plants, env)
-        # 2. Reproduction
-        elif self.repro_drive >= REPRO_THRESHOLD:
-            mates = [
-                a for a in others
-                if a.alive and a.species == self.species and a.sex != self.sex
-            ]
-            positions = [(a.x, a.y) for a in mates]
-            self.move_towards(positions, env)
-        # 3. Random
+        # --- Perception ---
+        visible_plants = [
+            p for p in env.plants if self.within_vision(*p)
+        ]
+
+        visible_mates = [
+            a for a in others
+            if (
+                a.alive
+                and a.species == self.species
+                and a.sex != self.sex
+                and self.within_vision(a.x, a.y)
+            )
+        ]
+
+        # --- Movement decision ---
+        if self.hunger >= HUNGER_THRESHOLD and visible_plants:
+            self.move_towards(visible_plants, env)
+
+        elif self.repro_drive >= REPRO_THRESHOLD and visible_mates:
+            mate_positions = [(a.x, a.y) for a in visible_mates]
+            self.move_towards(mate_positions, env)
+
         else:
             self.move_randomly(env)
 
-        # --- Eat plants if on the same cell ---
+        # --- Eat ---
         if (self.x, self.y) in env.plants:
             env.plants.remove((self.x, self.y))
             self.hunger = 0
 
-        # --- Try to mate ---
         self.try_to_mate(others)
 
 
@@ -219,52 +264,52 @@ class Herbivore(Animal):
 
 class Carnivore(Animal):
     def __init__(self, x, y):
-        super().__init__(x, y, "carnivore")
+        super().__init__(x, y, "carnivore", vision_radius=VISION_RADIUS_CARNIVORE)
 
     def step(self, env, others):
-        # Increase hunger, repro drive, etc.
         super().step(env, others)
 
+        # --- Perception ---
+        visible_prey = [
+            a for a in others
+            if (
+                isinstance(a, Herbivore)
+                and a.alive
+                and self.within_vision(a.x, a.y)
+            )
+        ]
+
+        visible_mates = [
+            a for a in others
+            if (
+                a.alive
+                and a.species == self.species
+                and a.sex != self.sex
+                and self.within_vision(a.x, a.y)
+            )
+        ]
+
         # --- Movement decision ---
-        # 1. Hunt if hungry
-        if self.hunger >= HUNGER_THRESHOLD:
-            prey_positions = [
-                (a.x, a.y)
-                for a in others
-                if isinstance(a, Herbivore) and a.alive
-            ]
+        if self.hunger >= HUNGER_THRESHOLD and visible_prey:
+            prey_positions = [(a.x, a.y) for a in visible_prey]
             self.move_towards(prey_positions, env)
 
-        # 2. Seek mate if reproductively motivated
-        elif self.repro_drive >= REPRO_THRESHOLD:
-            mates = [
-                a for a in others
-                if (
-                    a.alive
-                    and a.species == self.species
-                    and a.sex != self.sex
-                )
-            ]
-            mate_positions = [(a.x, a.y) for a in mates]
+        elif self.repro_drive >= REPRO_THRESHOLD and visible_mates:
+            mate_positions = [(a.x, a.y) for a in visible_mates]
             self.move_towards(mate_positions, env)
 
-        # 3. Otherwise wander
         else:
             self.move_randomly(env)
 
-        # --- Eat herbivore if present ---
-        for other in others:
-            if (
-                isinstance(other, Herbivore)
-                and other.alive
-                and (other.x, other.y) == (self.x, self.y)
-            ):
+        # --- Eat ---
+        for other in visible_prey:
+            if (other.x, other.y) == (self.x, self.y):
                 other.alive = False
                 self.hunger = 0
                 break
 
-        # --- Attempt mating ---
         self.try_to_mate(others)
+
 
 
 
@@ -273,10 +318,25 @@ class Carnivore(Animal):
 class Simulation:
     def __init__(self, width=20, height=20, n_herb=20, n_carn=12):
         self.env = Environment(width, height)
-        self.animals = [Herbivore(random.randrange(width), random.randrange(height)) for _ in range(n_herb)]
-        self.animals += [Carnivore(random.randrange(width), random.randrange(height)) for _ in range(n_carn)]
+
+        self.animals = []
+
+        # Spawn herbivores on land
+        for _ in range(n_herb):
+            x, y = self.env.random_land_cell()
+            self.animals.append(Herbivore(x, y))
+
+        # Spawn carnivores on land
+        for _ in range(n_carn):
+            x, y = self.env.random_land_cell()
+            self.animals.append(Carnivore(x, y))
+
         self.time = 0
-        self.history = {"herbivores": [], "carnivores": []}
+        self.history = {
+            "herbivores": [],
+            "carnivores": []
+        }
+
 
     def step(self):
         new_animals = []
@@ -288,7 +348,7 @@ class Simulation:
                 if animal.pregnant:
                     animal.gestation_timer -= 1
                     if animal.gestation_timer <= 0:
-                        births = animal.give_birth()
+                        births = animal.give_birth(self.env)
                         for x, y in births:
                             if animal.species == "herbivore":
                                 new_animals.append(Herbivore(x, y))
@@ -313,11 +373,22 @@ class Simulation:
         self.history["carnivores"].append(carn_count)
         self.history.setdefault("births", []).append(births)
 
+        for a in self.animals:
+            assert self.env.grid[a.y][a.x] == 0, "Animal in water!"
+            
 
 # --- Visualization ---
 sim = Simulation(width=WORLD_SIZE, height=WORLD_SIZE, n_carn=N_CARNIVORES, n_herb=N_HERBIVORES)
 
-fig, (ax_map, ax_pop) = plt.subplots(1, 2, figsize=(10, 5))
+fig, (ax_map, ax_pop) = plt.subplots(1, 2, figsize=(20, 10), gridspec_kw={'wspace': 0.4})
+plt.tight_layout()
+
+
+def plot_group(cls, sex, color, marker, label):
+    xs = [a.x for a in sim.animals if isinstance(a, cls) and a.alive and a.sex == sex]
+    ys = [a.y for a in sim.animals if isinstance(a, cls) and a.alive and a.sex == sex]
+    ax_map.scatter(xs, ys, c=color, marker=marker, label=label)
+
 
 def update(frame):
     sim.step()
@@ -326,26 +397,49 @@ def update(frame):
     ax_map.clear()
     ax_pop.clear()
 
-    # Draw environment
-    ax_map.imshow(sim.env.grid, cmap="Blues", alpha=0.3)
-    px, py = zip(*sim.env.plants) if sim.env.plants else ([], [])
-    ax_map.scatter(px, py, c="green", marker=".", label="plants")
+    # Terrain
+    heightmap = sim.env.heightmap
+    terrain = np.zeros_like(heightmap)
+    terrain[heightmap < SEA_LEVEL] = 0
+    terrain[(heightmap >= SEA_LEVEL) & (heightmap < BEACH_LEVEL)] = 1
+    terrain[heightmap >= BEACH_LEVEL] = 2
+
+    terrain_cmap = ListedColormap(["#4a90e2", "#f2d16b", "#7cb342"])
+
+    ax_map.imshow(terrain, cmap=terrain_cmap, origin="lower")
+
+    # Plants
+    if sim.env.plants:
+        px, py = zip(*sim.env.plants)
+        ax_map.scatter(px, py, c="#1b5e20", marker=".", label="Plants")
+
 
     # Draw animals
-    hx = [a.x for a in sim.animals if isinstance(a, Herbivore) and a.alive]
-    hy = [a.y for a in sim.animals if isinstance(a, Herbivore) and a.alive]
-    cx = [a.x for a in sim.animals if isinstance(a, Carnivore) and a.alive]
-    cy = [a.y for a in sim.animals if isinstance(a, Carnivore) and a.alive]
-    ax_map.scatter(hx, hy, c="orange", label="herbivores")
-    ax_map.scatter(cx, cy, c="red", label="carnivores")
+    plot_group(Herbivore, "F", "orange", "o", "Herbivore ♀")
+    plot_group(Herbivore, "M", "orange", "D", "Herbivore ♂")
+    plot_group(Carnivore, "F", "red", "o", "Carnivore ♀")
+    plot_group(Carnivore, "M", "red", "D", "Carnivore ♂")
+
     ax_map.set_title(f"Step {sim.time-1}")
-    ax_map.legend(loc="upper right")
+    ax_map.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1),
+        borderaxespad=0,
+        fontsize=8,
+        frameon=False
+    )
 
     # Plot populations
     ax_pop.plot(sim.history["herbivores"], label="herbivores", color="orange")
     ax_pop.plot(sim.history["carnivores"], label="carnivores", color="red")
     ax_pop.set_title("Population over time")
-    ax_pop.legend()
+    ax_pop.legend(
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1),
+        borderaxespad=0,
+        fontsize=8,
+        frameon=False
+    )
 
 ani = animation.FuncAnimation(fig, update, frames=200, interval=100, repeat=False)
 plt.show()
